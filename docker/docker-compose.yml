@@ -1,0 +1,151 @@
+services:
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: osym_rehberi_backend
+    restart: always # ✅ Her zaman yeniden başlat (unless-stopped yerine)
+    ports:
+      - "8003:8000" # Host 8003 → container 8000 (uvicorn)
+    environment:
+      # ✅ PostgreSQL'e geçiş yapıldı
+      # ✅ CRITICAL: DATABASE_URL psycopg2 driver ile (senkron bağlantı için)
+      # ✅ CRITICAL: localhost yerine 'db' servis adını kullan (Docker network)
+      - DATABASE_URL=${DATABASE_URL:-postgresql+psycopg2://osym_user:osym_password@db:5432/osym_rehber}
+      - POSTGRES_USER=${POSTGRES_USER:-osym_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-osym_password}
+      - POSTGRES_DB=${POSTGRES_DB:-osym_rehber}
+      - POSTGRES_HOST=${POSTGRES_HOST:-db} # ✅ Docker servis adı (localhost değil!)
+      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+      - PYTHONPATH=/app
+      - LOG_LEVEL=INFO
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY} # ✅ Google Gemini API Key - Chatbot için
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
+      - GROQ_MODEL=${GROQ_MODEL:-llama-3.3-70b-versatile}
+    volumes:
+      - ../backend:/app
+      - backend_logs:/app/logs
+      - ml_models:/app/ml_models
+    # ✅ CRITICAL: Uvicorn timeout ve retry ayarları - container çökmesini önlemek için
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload --timeout-keep-alive 120 --timeout-graceful-shutdown 30 --log-level info
+    depends_on:
+      db:
+        condition: service_healthy # ✅ Veritabanı hazır olana kadar bekle
+    networks:
+      - osym_network
+    # ✅ CRITICAL: Healthcheck ekle - container'ın sağlıklı olduğunu kontrol et
+    # Python ile HTTP isteği yap (curl yerine - daha güvenilir)
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=25).read()" ]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+      start_period: 60s # ✅ Backend'in başlaması için yeterli süre (veritabanı bekleme dahil - 10 deneme x 5 saniye = 50 saniye + buffer)
+
+  # frontend:
+  #   build:
+  #     context: ../frontend
+  #     dockerfile: Dockerfile
+  #   container_name: osym_rehberi_frontend
+  #   ports:
+  #     - "3002:3000"
+  #   volumes:
+  #     - ../frontend:/app
+  #     - /app/node_modules
+  #   environment:
+  #     - CHOKIDAR_USEPOLLING=true
+  #   command: flutter run -d web-server --web-hostname 0.0.0.0 --web-port 3000
+
+  db:
+    image: postgres:15-alpine
+    container_name: osym_rehberi_db
+    restart: always # ✅ Her zaman yeniden başlat
+    environment:
+      - POSTGRES_DB=osym_rehber
+      - POSTGRES_USER=osym_user
+      - POSTGRES_PASSWORD=osym_password
+    volumes:
+      # ✅ CRITICAL: Kalıcı veri saklama - container silinse bile veriler korunur
+      # WSL/Windows'ta bind mount izin sorunları yaratıyor, bu yüzden named volume kullanılıyor
+      # Volume'u görmek için: docker volume inspect docker_postgres_data
+      # Volume'u yedeklemek için (Bash/WSL): docker run --rm -v docker_postgres_data:/data -v $(pwd):/backup alpine tar czf /backup/postgres_backup.tar.gz /data
+      # Volume'u yedeklemek için (PowerShell): docker run --rm -v docker_postgres_data:/data -v ${PWD}:/backup alpine tar czf /backup/postgres_backup.tar.gz /data
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5435:5432"
+    networks:
+      - osym_network
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U osym_user -d osym_rehber" ]
+      interval: 5s # ✅ 30s'den 5s'ye düşürüldü - daha hızlı kontrol
+      timeout: 5s # ✅ 10s'den 5s'ye düşürüldü
+      retries: 5 # ✅ 3'ten 5'e çıkarıldı - daha fazla deneme
+      start_period: 10s # ✅ 30s'den 10s'ye düşürüldü - daha hızlı başlangıç
+
+  redis:
+    image: redis:7-alpine
+    container_name: osym_rehberi_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    networks:
+      - osym_network
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  celery_worker:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: osym_rehberi_celery_worker
+    environment:
+      # ✅ CRITICAL: Celery worker için de aynı DATABASE_URL formatı
+      - DATABASE_URL=${DATABASE_URL:-postgresql+psycopg2://osym_user:osym_password@db:5432/osym_rehber}
+      - POSTGRES_USER=${POSTGRES_USER:-osym_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-osym_password}
+      - POSTGRES_DB=${POSTGRES_DB:-osym_rehber}
+      - POSTGRES_HOST=${POSTGRES_HOST:-db} # ✅ Docker servis adı
+      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+      - REDIS_URL=redis://redis:6379/0
+      - PYTHONPATH=/app
+      - LOG_LEVEL=INFO
+      - GEMINI_API_KEY=${GEMINI_API_KEY} # ✅ Google Gemini API Key
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
+      - GROQ_MODEL=${GROQ_MODEL:-llama-3.3-70b-versatile}
+    volumes:
+      - ../backend:/app
+      - backend_logs:/app/logs
+      - ml_models:/app/ml_models
+    command: celery -A celery_app worker --loglevel=info --concurrency=2
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - osym_network
+
+networks:
+  osym_network:
+    driver: bridge
+
+volumes:
+  # ✅ CRITICAL: PostgreSQL verileri için kalıcı named volume
+  # WSL/Windows'ta bind mount izin sorunları yaratıyor, bu yüzden named volume kullanılıyor
+  # Bu volume sayesinde container silinse bile veriler korunur
+  # Volume'u silmek için: docker volume rm osym_rehberi_postgres_data
+  # Volume'u görmek için: docker volume inspect osym_rehberi_postgres_data
+  postgres_data:
+  backend_logs:
+  ml_models:
+  redis_data:

@@ -1,0 +1,931 @@
+# -*- coding: utf-8 -*-
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.orm import Session
+from typing import List, Optional
+
+from database import get_db
+from models import University, Department
+from schemas.university import (
+    UniversityCreate, UniversityUpdate, UniversityResponse,
+    DepartmentCreate, DepartmentUpdate, DepartmentResponse, DepartmentWithUniversityResponse
+)
+
+router = APIRouter()
+
+def _normalize_university_type_filter(value: str) -> str:
+    """
+    Normalize university_type filter to match DB values.
+    DB commonly stores: 'devlet', 'vakif', 'kktc'
+    Frontend may send: 'Devlet', 'Vakıf', 'state', 'foundation'
+    """
+    normalized = value.strip().lower()
+    normalized = (
+        normalized.replace("ı", "i")
+        .replace("İ", "i")
+        .replace("ş", "s")
+        .replace("Ş", "s")
+        .replace("ğ", "g")
+        .replace("Ğ", "g")
+        .replace("ü", "u")
+        .replace("Ü", "u")
+        .replace("ö", "o")
+        .replace("Ö", "o")
+        .replace("ç", "c")
+        .replace("Ç", "c")
+    )
+
+    if normalized in {"devlet", "state", "public"}:
+        return "devlet"
+    if normalized in {"vakif", "vakıf", "foundation", "private"}:
+        return "vakif"
+    if normalized in {"kktc", "kibris", "cyprus"}:
+        return "kktc"
+    if normalized in {"yurtdisi", "yurtdışı", "yurt disi", "yurt dışı", "abroad"}:
+        return "yurtdisi"
+    return normalized
+
+
+def _canonical_field_types_from_filters(field_types: List[str]) -> List[str]:
+    """Map API variants (SOZ, dil, tyt) to stored Department.field_type values."""
+    canonical: List[str] = []
+    for raw in field_types:
+        if raw is None or not str(raw).strip():
+            continue
+        u = str(raw).strip().upper()
+        if u in ("DIL", "YDIL") or "DİL" in u or "DIL" in u:
+            canonical.append("DİL")
+        elif u in ("SOZ", "SÖZ", "TS") or "SÖZ" in u or "SOZ" in u:
+            canonical.append("SÖZ")
+        elif "TYT" in u:
+            canonical.append("TYT")
+        elif "EA" in u:
+            canonical.append("EA")
+        elif "SAY" in u or "TM" in u:
+            canonical.append("SAY")
+        else:
+            canonical.append(u)
+    # de-duplicate preserving order
+    seen = set()
+    out: List[str] = []
+    for ft in canonical:
+        if ft not in seen:
+            seen.add(ft)
+            out.append(ft)
+    return out
+
+
+# ⚠️ ÖNEMLİ: FastAPI'da spesifik route'lar önce, genel pattern'ler sonda olmalı!
+# Yoksa /{university_id} tüm istekleri yakalar
+
+# Spesifik endpoints (önce bunlar)
+@router.get("/cities/", response_model=List[str])
+async def get_cities(db: Session = Depends(get_db)):
+    """81 il + KKTC şehirlerini getir (81 il öncelikli) - OPTIMIZED with CACHE"""
+    # ✅ Cache'den kontrol et (ama her zaman 81 il + KKTC döndürmeli)
+    from core.cache import get_cache, set_cache
+    from datetime import timedelta
+    # ✅ Cache'i kullan
+    cached_cities = get_cache("cities", ttl=timedelta(hours=24))
+    if cached_cities is not None:
+        return cached_cities
+    
+    # 81 il listesi (seed_yok_data.py'den)
+    TURKISH_81_CITIES = [
+        "Adana", "Adıyaman", "Afyonkarahisar", "Ağrı", "Aksaray", "Amasya", "Ankara", "Antalya",
+        "Ardahan", "Artvin", "Aydın", "Balıkesir", "Bartın", "Batman", "Bayburt", "Bilecik",
+        "Bingöl", "Bitlis", "Bolu", "Burdur", "Bursa", "Çanakkale", "Çankırı", "Çorum",
+        "Denizli", "Diyarbakır", "Düzce", "Edirne", "Elazığ", "Erzincan", "Erzurum", "Eskişehir",
+        "Gaziantep", "Giresun", "Gümüşhane", "Hakkari", "Hatay", "Iğdır", "Isparta", "İstanbul",
+        "İzmir", "Kahramanmaraş", "Karabük", "Karaman", "Kars", "Kastamonu", "Kayseri", "Kırıkkale",
+        "Kırklareli", "Kırşehir", "Kilis", "Kocaeli", "Konya", "Kütahya", "Malatya", "Manisa",
+        "Mardin", "Mersin", "Muğla", "Muş", "Nevşehir", "Niğde", "Ordu", "Osmaniye",
+        "Rize", "Sakarya", "Samsun", "Siirt", "Sinop", "Sivas", "Şanlıurfa", "Şırnak",
+        "Tekirdağ", "Tokat", "Trabzon", "Tunceli", "Uşak", "Van", "Yalova", "Yozgat", "Zonguldak"
+    ]
+
+    # ✅ KKTC şehirleri (DB'ye bağımlı olmasın diye sabit liste)
+    # Not: DB bağlantısı bazen ayağa kalkmadan endpoint çağrılabiliyor; bu endpoint'in 500 vermemesi kritik.
+    KKTC_CITIES = [
+        "Lefkoşa",
+        "Gazimağusa",
+        "Girne",
+        "Güzelyurt",
+        "İskele",
+    ]
+    
+    # Sıralama: 81 il + KKTC + diğerleri
+    result = []
+    
+    # Türkçe karakterler için özel sıralama ve normalize fonksiyonu
+    def normalize_city_name(text: str) -> str:
+        """Şehir adını normalize et (Türkçe karakterleri İngilizce karşılıklarına çevir)"""
+        replacements = {
+            'ç': 'c', 'ğ': 'g', 'ı': 'i', 'ö': 'o', 'ş': 's', 'ü': 'u',
+            'Ç': 'c', 'Ğ': 'g', 'İ': 'i', 'Ö': 'o', 'Ş': 's', 'Ü': 'u'
+        }
+        result = text.lower().strip()
+        for tr, en in replacements.items():
+            result = result.replace(tr, en)
+        return result
+    
+    def turkish_sort_key(text: str) -> str:
+        """Sıralama için normalize edilmiş key"""
+        return normalize_city_name(text)
+    
+    # ✅ 81 il listesini normalize et (karşılaştırma için)
+    # (Gelecekte DB'den gelen şehirler eklenecekse bu map kullanılabilir.)
+    normalized_81_cities = {normalize_city_name(city): city for city in TURKISH_81_CITIES}
+    
+    # ✅ Sadece 81 il + KKTC şehirlerini döndür (DB'deki yanlış yazılmış şehirleri ekleme)
+    # 1. 81 il (Türkçe alfabetik sıralı)
+    result.extend(sorted(TURKISH_81_CITIES, key=turkish_sort_key))
+    
+    # 2. KKTC şehirleri (Türkçe alfabetik sıralı)
+    result.extend(sorted(KKTC_CITIES, key=turkish_sort_key))
+    
+    # ✅ DB'deki diğer şehirleri EKLEME (yanlış yazılmış versiyonlar olabilir)
+    # Sadece 81 il + KKTC = 86 şehir döndür
+    
+    # ✅ Duplicate temizleme - normalize edilmiş karşılaştırma ile
+    seen = set()
+    unique_result = []
+    for city in result:
+        city_normalized = normalize_city_name(city)
+        
+        # Eğer normalize edilmiş versiyonu daha önce görülmüşse, ekleme
+        if city_normalized not in seen:
+            seen.add(city_normalized)
+            unique_result.append(city)
+    
+    # ✅ Cache'e kaydet
+    set_cache("cities", unique_result, ttl=timedelta(hours=24))
+    
+    # ✅ Debug: Kaç şehir döndürüldü?
+    from core.logging_config import api_logger
+    api_logger.info(f"Cities endpoint: {len(unique_result)} unique cities returned (81 il + KKTC)")
+    
+    return unique_result
+
+
+@router.get("/field-types/", response_model=List[str])
+async def get_field_types(db: Session = Depends(get_db)):
+    """Tüm alan türlerini getir (cached) - OPTIMIZED with CACHE"""
+    from core.cache import get_cache, set_cache
+    from datetime import timedelta
+    
+    # ✅ Cache'den kontrol et (startup'ta yüklenen cache)
+    cached = get_cache("field_types", ttl=timedelta(hours=24))
+    if cached is not None:
+        return cached
+    
+    # ✅ OPTIMIZED: Sadece distinct field_type değerlerini çek
+    from sqlalchemy import distinct
+    field_types_result = db.query(distinct(Department.field_type)).filter(Department.field_type.isnot(None)).all()
+    result = [field_type[0] for field_type in field_types_result if field_type[0]]
+    
+    # ✅ Cache'e kaydet (startup cache key ile uyumlu)
+    set_cache("field_types", result, ttl=timedelta(hours=24))
+    return result
+
+
+# University endpoints
+@router.post("", response_model=UniversityResponse)
+async def create_university(university: UniversityCreate, db: Session = Depends(get_db)):
+    """Yeni üniversite oluştur"""
+    db_university = University(**university.dict())
+    db.add(db_university)
+    db.commit()
+    db.refresh(db_university)
+    return db_university
+
+
+def _build_yearly_scores(dept) -> list:
+    """Son 4 yıla ait sıralama ve puan listesi döndürür (yıl azalan sırada).
+    
+    Frontend: en güncel yıl köşede zaten gösterildiği için altta 3 önceki yıl render edilir.
+    Buradan 4 yıl döndürülür ki frontend en güncel yılı kolayca atlayabilsin.
+    """
+    stats = getattr(dept, "yearly_stats", None) or []
+    sorted_stats = sorted(stats, key=lambda s: s.year, reverse=True)[:4]
+    return [
+        {
+            "year": s.year,
+            "min_score": s.min_score,
+            "min_rank": s.min_rank,
+            "quota": s.quota,
+        }
+        for s in sorted_stats
+    ]
+
+
+def get_university_logo_url(university: University) -> Optional[str]:
+    """Üniversite logosu URL'i oluştur"""
+    if university.website:
+        # Website varsa, domain'den favicon çek (Google Favicon API)
+        domain = university.website.replace('http://', '').replace('https://', '').replace('www.', '').split('/')[0]
+        return f"https://www.google.com/s2/favicons?domain={domain}&sz=256"
+    return None
+
+
+@router.get("", response_model=List[UniversityResponse])
+async def get_universities(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    city: Optional[str] = Query(None),
+    university_type: Optional[str] = Query(None),
+    db: Session = Depends(get_db)
+):
+    """Üniversite listesini getir"""
+    query = db.query(University)
+    
+    if city:
+        query = query.filter(University.city.ilike(f"%{city}%"))
+    if university_type:
+        from sqlalchemy import func
+        normalized_type = _normalize_university_type_filter(university_type)
+        query = query.filter(func.lower(University.university_type) == normalized_type)
+    
+    # ✅ En iyi üniversite öne: bölümlerinin en yüksek taban puanına göre azalan sıra
+    from sqlalchemy import func as sqlfunc, case, desc
+    dept_score_sq = (
+        db.query(
+            Department.university_id,
+            sqlfunc.max(Department.min_score).label("best_score"),
+        )
+        .filter(Department.min_score.isnot(None))
+        .group_by(Department.university_id)
+        .subquery()
+    )
+    query = (
+        query
+        .outerjoin(dept_score_sq, University.id == dept_score_sq.c.university_id)
+        .order_by(
+            case((dept_score_sq.c.best_score.is_(None), 1), else_=0),
+            desc(dept_score_sq.c.best_score),
+            University.name,
+        )
+    )
+    
+    universities = query.offset(skip).limit(limit).all()
+    
+    # Logo URL'lerini ekle ve response oluştur
+    result = []
+    for uni in universities:
+        # Pydantic response oluştur
+        uni_response = UniversityResponse(
+            id=uni.id,
+            name=uni.name,
+            city=uni.city,
+            university_type=uni.university_type,
+            website=uni.website,
+            established_year=uni.established_year,
+            latitude=uni.latitude,
+            longitude=uni.longitude,
+            created_at=uni.created_at,
+            updated_at=uni.updated_at,
+            logo_url=get_university_logo_url(uni)
+        )
+        result.append(uni_response)
+    
+    return result
+
+
+# Genel pattern'ler (SON SIRA - yoksa her şeyi yakalar!)
+@router.get("/{university_id}", response_model=UniversityResponse)
+async def get_university(university_id: int, db: Session = Depends(get_db)):
+    """Belirli bir üniversiteyi getir"""
+    university = db.query(University).filter(University.id == university_id).first()
+    if not university:
+        raise HTTPException(status_code=404, detail="Üniversite bulunamadı")
+    
+    # Logo URL'ini ekle
+    return UniversityResponse(
+        id=university.id,
+        name=university.name,
+        city=university.city,
+        university_type=university.university_type,
+        website=university.website,
+        established_year=university.established_year,
+        latitude=university.latitude,
+        longitude=university.longitude,
+        created_at=university.created_at,
+        updated_at=university.updated_at,
+        logo_url=get_university_logo_url(university)
+    )
+
+
+@router.put("/{university_id}", response_model=UniversityResponse)
+async def update_university(
+    university_id: int,
+    university_update: UniversityUpdate,
+    db: Session = Depends(get_db)
+):
+    """Üniversite bilgilerini güncelle"""
+    university = db.query(University).filter(University.id == university_id).first()
+    if not university:
+        raise HTTPException(status_code=404, detail="Üniversite bulunamadı")
+    
+    update_data = university_update.dict(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(university, field, value)
+    
+    db.commit()
+    db.refresh(university)
+    return university
+
+
+@router.delete("/{university_id}")
+async def delete_university(university_id: int, db: Session = Depends(get_db)):
+    """Üniversiteyi sil"""
+    university = db.query(University).filter(University.id == university_id).first()
+    if not university:
+        raise HTTPException(status_code=404, detail="Üniversite bulunamadı")
+    
+    db.delete(university)
+    db.commit()
+    return {"message": "Üniversite başarıyla silindi"}
+
+
+# Department endpoints
+@router.post("/departments", response_model=DepartmentResponse)
+async def create_department(department: DepartmentCreate, db: Session = Depends(get_db)):
+    """Yeni bölüm oluştur"""
+    # Üniversite var mı kontrol et
+    university = db.query(University).filter(University.id == department.university_id).first()
+    if not university:
+        raise HTTPException(status_code=404, detail="Üniversite bulunamadı")
+    
+    db_department = Department(**department.dict())
+    db.add(db_department)
+    db.commit()
+    db.refresh(db_department)
+    return db_department
+
+
+@router.get("/departments/unique/", response_model=List[dict])
+async def get_unique_departments(
+    university_type: Optional[str] = Query(None, description="Üniversite türü: devlet, vakif"),
+    field_type: Optional[str] = Query(None, description="Alan türü: SAY, EA, SÖZ, DİL"),
+    db: Session = Depends(get_db)
+):
+    """
+    ✅ Normalize edilmiş bölüm isimlerini TEKİL olarak listele
+    
+    Kullanım Senaryosu:
+    1. Üniversite türü seçilir (devlet/vakif)
+    2. Bu endpoint çağrılır -> unique bölüm isimleri döner
+    3. Kullanıcı bir bölüm seçer (örn: "Psikoloji")
+    4. /departments/ endpoint'i normalized_name filtresi ile çağrılır -> tüm varyasyonları döner
+    """
+    from sqlalchemy import distinct, func
+    from sqlalchemy.orm import selectinload
+    
+    # ✅ Normalize edilmiş isimlere göre unique bölümleri getir
+    query = db.query(
+        Department.normalized_name,
+        func.count(Department.id).label('variation_count'),
+        func.min(Department.id).label('representative_id')
+    ).filter(
+        Department.normalized_name.isnot(None)
+    )
+    
+    # Üniversite türü filtresi için join (case-insensitive, DB stores lowercase)
+    if university_type:
+        query = query.join(University, Department.university_id == University.id)
+        normalized_ut = _normalize_university_type_filter(university_type)
+        query = query.filter(func.lower(University.university_type) == normalized_ut)
+
+    # Alan türü filtresi (SOZ / DIL varyantları)
+    if field_type:
+        fts = _canonical_field_types_from_filters([field_type])
+        if fts:
+            query = query.filter(Department.field_type.in_(fts))
+    
+    # Grupla ve sırala
+    query = query.group_by(Department.normalized_name)
+    query = query.order_by(Department.normalized_name)
+    
+    results = query.all()
+    
+    # Response formatı
+    unique_departments = []
+    for result in results:
+        normalized_name = result.normalized_name
+        variation_count = result.variation_count
+        representative_id = result.representative_id
+        
+        # Representative department'ı al (attributes için)
+        rep_dept = db.query(Department).filter(Department.id == representative_id).first()
+        attributes = []
+        if rep_dept and rep_dept.attributes:
+            import json
+            try:
+                attributes = json.loads(rep_dept.attributes)
+            except:
+                attributes = []
+        
+        unique_departments.append({
+            'normalized_name': normalized_name,
+            'variation_count': variation_count,
+            'attributes_examples': attributes[:3] if attributes else [],  # İlk 3 attribute örneği
+        })
+    
+    return unique_departments
+
+
+@router.get("/departments/", response_model=List[DepartmentWithUniversityResponse])
+async def get_departments(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50000, ge=1, le=50000),  # ✅ Default 50000, max 50000 - tüm veriler gelsin (21.600+ kayıt için)
+    field_types: Optional[List[str]] = Query(None, alias="field_type"),
+    degree_types: Optional[List[str]] = Query(
+        None,
+        alias="degree_type",
+        description="✅ Derece türü: 'Associate' (Önlisans) veya 'Bachelor' (Lisans). None ise tümü getirilir.",
+    ),
+    university_id: Optional[int] = Query(None),
+    cities: Optional[List[str]] = Query(None, alias="city"),
+    university_types: Optional[List[str]] = Query(None, alias="university_type"),
+    normalized_name: Optional[str] = Query(
+        None,
+        description="✅ Normalize edilmiş bölüm ismi (unique endpoint'ten alınır)",
+    ),
+    min_score: Optional[float] = Query(None),
+    max_score: Optional[float] = Query(None),
+    has_scholarship: Optional[bool] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """Bölüm listesini getir - OPTIMIZED with eager loading and selectinload"""
+    try:
+        # ✅ OPTIMIZED: selectinload ile N+1 problemini tamamen önle
+        from sqlalchemy.orm import selectinload
+        from sqlalchemy import case, or_, func
+        
+        # ✅ OPTIMIZED: Sadece city veya university_type filtresi varsa join yap
+        query = db.query(Department)
+        
+        # ✅ OPTIMIZED: selectinload ile University ve yearly_stats bilgilerini tek sorguda çek
+        from models.university import DepartmentYearlyStats
+        query = query.options(
+            selectinload(Department.university),
+            selectinload(Department.yearly_stats),
+        )
+        
+        # Filtreleme - city veya university_type için join gerekli
+        if cities or university_types:
+            query = query.join(University, Department.university_id == University.id)
+        
+        # ✅ PERMISSIVE FILTERING: Only apply filters if they are provided (not None)
+        if field_types:
+            normalized_field_types = _canonical_field_types_from_filters(
+                [ft for ft in field_types if ft is not None and str(ft).strip()]
+            )
+            if normalized_field_types:
+                query = query.filter(Department.field_type.in_(normalized_field_types))
+
+                # ✅ ÖNEMLİ: Eğer TYT seçildiyse, degree_type'ı otomatik olarak 'Associate' olarak kabul et
+                if "TYT" in normalized_field_types:
+                    query = query.filter(
+                        or_(
+                            Department.degree_type == "Associate",
+                            Department.degree_type == "Önlisans",
+                            Department.degree_type == "onlisans",
+                            Department.degree_type == "önlisans",
+                        )
+                    )
+        # ✅ If field_types is None, don't filter by field_type (return all field types)
+        
+        if degree_types:
+            # ✅ degree_type mapping: Frontend'den gelen "Associate"/"Bachelor" değerlerini
+            # veritabanındaki "Associate"/"Bachelor" veya "Önlisans"/"Lisans" değerleriyle eşleştir
+            degree_conds = []
+            for degree_type in degree_types:
+                if not degree_type:
+                    continue
+                dt_lower = str(degree_type).strip().lower()
+                if degree_type == "Associate" or dt_lower in (
+                    "önlisans",
+                    "onlisans",
+                    "on-lisans",
+                ):
+                    # Frontend "Associate" gönderiyor -> veritabanında "Associate", "Önlisans", "onlisans" olabilir
+                    degree_conds.append(
+                        or_(
+                            Department.degree_type == "Associate",
+                            Department.degree_type == "Önlisans",
+                            Department.degree_type == "onlisans",
+                            Department.degree_type == "önlisans",
+                        )
+                    )
+                elif degree_type == "Bachelor" or dt_lower in (
+                    "lisans",
+                    "license",
+                ):
+                    # Frontend "Bachelor" gönderiyor -> veritabanında "Bachelor", "Lisans", "lisans" olabilir
+                    degree_conds.append(
+                        or_(
+                            Department.degree_type == "Bachelor",
+                            Department.degree_type == "Lisans",
+                            Department.degree_type == "lisans",
+                        )
+                    )
+                else:
+                    # Diğer durumlarda direkt eşleştir
+                    degree_conds.append(Department.degree_type == degree_type)
+
+            if degree_conds:
+                query = query.filter(or_(*degree_conds))
+        # ✅ If degree_types is None, don't filter by degree_type (return all degree types)
+        if university_id:
+            query = query.filter(Department.university_id == university_id)
+        if cities:
+            # ✅ CASE-INSENSITIVE + TÜRKÇE KARAKTER DESTEĞİ: Şehir filtresi (çoklu seçim)
+            normalized_cities = [
+                c.strip().lower() for c in cities if c is not None and c.strip()
+            ]
+            if normalized_cities:
+                city_conditions = [
+                    func.lower(University.city).contains(city_normalized)
+                    for city_normalized in normalized_cities
+                ]
+                query = query.filter(or_(*city_conditions))
+        if university_types:
+            normalized_types = {
+                _normalize_university_type_filter(ut)
+                for ut in university_types
+                if ut is not None and ut.strip()
+            }
+            if normalized_types:
+                query = query.filter(
+                    func.lower(University.university_type).in_(normalized_types)
+                )
+        if normalized_name:  # ✅ Normalize edilmiş isme göre filtrele (tüm varyasyonları getir)
+            query = query.filter(Department.normalized_name == normalized_name)
+        if min_score:
+            # ✅ min_score None olan bölümleri filtreleme dışında bırak (None kontrolü)
+            query = query.filter(Department.min_score.isnot(None), Department.min_score >= min_score)
+        if max_score:
+            # ✅ min_score None olan bölümleri filtreleme dışında bırak (None kontrolü)
+            query = query.filter(Department.min_score.isnot(None), Department.min_score <= max_score)
+        if has_scholarship is not None:
+            query = query.filter(Department.has_scholarship == has_scholarship)
+        
+        # ✅ En yüksek taban puan önce (en rekabetçi = en iyi); veri yoksa sona
+        from sqlalchemy import asc, desc
+        query = query.order_by(
+            case((Department.min_score.is_(None), 1), else_=0),   # min_score None olanlar sona
+            desc(Department.min_score),                            # En yüksek puan = en iyi önce
+            case((Department.min_rank.is_(None), 1), else_=0),
+            asc(Department.min_rank),
+        )
+        
+        # ✅ OPTIMIZED: Tek sorguda tüm verileri çek (selectinload ile University bilgileri de dahil)
+        departments = query.offset(skip).limit(limit).all()
+        
+        # ✅ N+1 problemi çözüldü: selectinload sayesinde University bilgileri zaten yüklendi
+        result = []
+        for dept in departments:
+            university = dept.university  # ✅ Artık ek sorgu yok, zaten yüklü
+            if not university:
+                continue  # Üniversite bulunamazsa skip et
+            
+            # University response'unu logo URL ile oluştur
+            university_response = UniversityResponse(
+                id=university.id,
+                name=university.name,
+                city=university.city,
+                university_type=university.university_type,
+                website=university.website,
+                established_year=university.established_year,
+                latitude=university.latitude,
+                longitude=university.longitude,
+                created_at=university.created_at,
+                updated_at=university.updated_at,
+                logo_url=get_university_logo_url(university)
+            )
+            
+            # ✅ Attributes'ı parse et
+            import json
+            attributes = []
+            if dept.attributes:
+                try:
+                    attributes = json.loads(dept.attributes)
+                except:
+                    attributes = []
+            
+            dept_response = DepartmentWithUniversityResponse(
+                id=dept.id,
+                university_id=dept.university_id,
+                name=dept.name,
+                normalized_name=dept.normalized_name,
+                attributes=attributes,
+                field_type=dept.field_type,
+                language=dept.language,
+                faculty=dept.faculty,
+                duration=dept.duration,
+                degree_type=dept.degree_type,
+                is_vocational=bool(getattr(dept, "is_vocational", False)),
+                min_score=dept.min_score,
+                min_rank=dept.min_rank,
+                quota=dept.quota,
+                scholarship_quota=dept.scholarship_quota,
+                tuition_fee=dept.tuition_fee,
+                has_scholarship=dept.has_scholarship,
+                last_year_min_score=dept.last_year_min_score,
+                last_year_min_rank=dept.last_year_min_rank,
+                last_year_quota=dept.last_year_quota,
+                description=dept.description,
+                requirements=dept.requirements,
+                created_at=dept.created_at,
+                updated_at=dept.updated_at,
+                university=university_response,
+                yearly_scores=_build_yearly_scores(dept),
+            )
+            result.append(dept_response)
+        
+        return result
+    except Exception as e:
+        # ✅ FALLBACK: Hata durumunda en popüler bölümleri döndür (500 hatası verme)
+        from core.logging_config import api_logger
+        api_logger.error(f"Error in get_departments: {str(e)}", error=str(e))
+        
+        try:
+            # En popüler bölümleri getir (min_score'a göre sıralı, None olanlar sona)
+            from sqlalchemy import case
+            fallback_query = db.query(Department).options(selectinload(Department.university))
+            # Fallback durumunda sadece ilk field_types değerini kullan (varsa)
+            if field_types:
+                fts_fb = _canonical_field_types_from_filters(
+                    [ft for ft in field_types if ft is not None and str(ft).strip()]
+                )
+                if fts_fb:
+                    fallback_query = fallback_query.filter(Department.field_type.in_(fts_fb))
+            
+            fallback_query = fallback_query.order_by(
+                case((Department.min_score.is_(None), 1), else_=0),
+                Department.min_score.desc().nullslast(),
+                Department.name
+            ).limit(min(limit, 50))  # Maksimum 50 bölüm döndür
+            
+            fallback_departments = fallback_query.all()
+            
+            # Response formatına çevir
+            fallback_result = []
+            for dept in fallback_departments:
+                university = dept.university
+                if not university:
+                    continue
+                
+                university_response = UniversityResponse(
+                    id=university.id,
+                    name=university.name,
+                    city=university.city,
+                    university_type=university.university_type,
+                    website=university.website,
+                    established_year=university.established_year,
+                    latitude=university.latitude,
+                    longitude=university.longitude,
+                    created_at=university.created_at,
+                    updated_at=university.updated_at,
+                    logo_url=get_university_logo_url(university)
+                )
+                
+                import json
+                attributes = []
+                if dept.attributes:
+                    try:
+                        attributes = json.loads(dept.attributes)
+                    except:
+                        attributes = []
+                
+                dept_response = DepartmentWithUniversityResponse(
+                    id=dept.id,
+                    university_id=dept.university_id,
+                    name=dept.name,
+                    normalized_name=dept.normalized_name,
+                    attributes=attributes,
+                    field_type=dept.field_type,
+                    language=dept.language,
+                    faculty=dept.faculty,
+                    duration=dept.duration,
+                    degree_type=dept.degree_type,
+                    is_vocational=bool(getattr(dept, "is_vocational", False)),
+                    min_score=dept.min_score,
+                    min_rank=dept.min_rank,
+                    quota=dept.quota,
+                    scholarship_quota=dept.scholarship_quota,
+                    tuition_fee=dept.tuition_fee,
+                    has_scholarship=dept.has_scholarship,
+                    last_year_min_score=dept.last_year_min_score,
+                    last_year_min_rank=dept.last_year_min_rank,
+                    last_year_quota=dept.last_year_quota,
+                    description=dept.description,
+                    requirements=dept.requirements,
+                    created_at=dept.created_at,
+                    updated_at=dept.updated_at,
+                    university=university_response,
+                    yearly_scores=_build_yearly_scores(dept),
+                )
+                fallback_result.append(dept_response)
+            
+            api_logger.info(f"Fallback: Returning {len(fallback_result)} popular departments")
+            return fallback_result
+        except Exception as fallback_error:
+            # Fallback de başarısız olursa boş liste döndür (500 hatası verme)
+            api_logger.error(f"Fallback also failed: {str(fallback_error)}", error=str(fallback_error))
+            return []
+
+
+@router.get("/departments/{department_id}", response_model=DepartmentWithUniversityResponse)
+async def get_department(department_id: int, db: Session = Depends(get_db)):
+    """Belirli bir bölümü getir"""
+    department = db.query(Department).filter(Department.id == department_id).first()
+    if not department:
+        raise HTTPException(status_code=404, detail="Bölüm bulunamadı")
+    
+    university = db.query(University).filter(University.id == department.university_id).first()
+    
+    # University response'unu logo URL ile oluştur
+    university_response = UniversityResponse(
+        id=university.id,
+        name=university.name,
+        city=university.city,
+        university_type=university.university_type,
+        website=university.website,
+        established_year=university.established_year,
+        latitude=university.latitude,
+        longitude=university.longitude,
+        created_at=university.created_at,
+        updated_at=university.updated_at,
+        logo_url=get_university_logo_url(university)
+    )
+    
+    import json
+
+    dept_attrs: List[str] = []
+    if department.attributes:
+        try:
+            dept_attrs = json.loads(department.attributes)
+        except (json.JSONDecodeError, TypeError):
+            dept_attrs = []
+
+    return DepartmentWithUniversityResponse(
+        id=department.id,
+        university_id=department.university_id,
+        name=department.name,
+        normalized_name=department.normalized_name,
+        attributes=dept_attrs,
+        field_type=department.field_type,
+        language=department.language,
+        faculty=department.faculty,
+        duration=department.duration,
+        degree_type=department.degree_type,
+        is_vocational=bool(getattr(department, "is_vocational", False)),
+        min_score=department.min_score,
+        min_rank=department.min_rank,
+        quota=department.quota,
+        scholarship_quota=department.scholarship_quota,
+        tuition_fee=department.tuition_fee,
+        has_scholarship=department.has_scholarship,
+        last_year_min_score=department.last_year_min_score,
+        last_year_min_rank=department.last_year_min_rank,
+        last_year_quota=department.last_year_quota,
+        description=department.description,
+        requirements=department.requirements,
+        created_at=department.created_at,
+        updated_at=department.updated_at,
+        university=university_response,
+        yearly_scores=_build_yearly_scores(department),
+    )
+
+
+@router.put("/departments/{department_id}", response_model=DepartmentResponse)
+async def update_department(
+    department_id: int,
+    department_update: DepartmentUpdate,
+    db: Session = Depends(get_db)
+):
+    """Bölüm bilgilerini güncelle"""
+    department = db.query(Department).filter(Department.id == department_id).first()
+    if not department:
+        raise HTTPException(status_code=404, detail="Bölüm bulunamadı")
+    
+    update_data = department_update.dict(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(department, field, value)
+    
+    db.commit()
+    db.refresh(department)
+    return department
+
+
+@router.delete("/departments/{department_id}")
+async def delete_department(department_id: int, db: Session = Depends(get_db)):
+    """Bölümü sil"""
+    department = db.query(Department).filter(Department.id == department_id).first()
+    if not department:
+        raise HTTPException(status_code=404, detail="Bölüm bulunamadı")
+    
+    db.delete(department)
+    db.commit()
+    return {"message": "Bölüm başarıyla silindi"}
+
+
+# Cities ve field-types endpoint'leri dosyanın başına taşındı (satır 19-30)
+
+
+# ✅ DEBUG ENDPOINT: Veri bütünlüğü kontrolü için
+@router.get("/debug/check-department/{name}")
+async def check_department_data(
+    name: str,
+    db: Session = Depends(get_db)
+):
+    """
+    ✅ GEÇİCİ DEBUG ENDPOINT: Bölüm verilerini kontrol et
+    
+    Veritabanındaki bölüm verilerinin doğruluğunu kontrol etmek için kullanılır.
+    Örnek: /api/universities/debug/check-department/Adalet
+    
+    Returns:
+        JSON: Bölümün ham verileri (duration, field_type, degree_type, vb.)
+    """
+    from sqlalchemy import or_
+    
+    # Bölüm adında (normalize edilmiş veya orijinal) arama yap
+    departments = db.query(Department).filter(
+        or_(
+            Department.name.ilike(f"%{name}%"),
+            Department.normalized_name.ilike(f"%{name}%")
+        )
+    ).limit(20).all()
+    
+    if not departments:
+        return {
+            "status": "not_found",
+            "message": f"'{name}' adında bölüm bulunamadı",
+            "results": []
+        }
+    
+    results = []
+    for dept in departments:
+        # Üniversite bilgisini al
+        university = db.query(University).filter(University.id == dept.university_id).first()
+        
+        results.append({
+            "id": dept.id,
+            "name": dept.name,  # Orijinal isim
+            "normalized_name": dept.normalized_name,  # Normalize edilmiş isim
+            "field_type": dept.field_type,  # ✅ Puan türü (TYT, SAY, EA, SÖZ, DİL)
+            "duration": dept.duration,  # ✅ Süre (2 veya 4+)
+            "degree_type": dept.degree_type,  # ✅ Derece türü (Associate, Bachelor)
+            "university_name": university.name if university else None,
+            "university_type": university.university_type if university else None,
+            "attributes": dept.attributes,  # JSON string
+            "language": dept.language,
+            "faculty": dept.faculty,
+            "min_score": dept.min_score,
+            "quota": dept.quota,
+            "created_at": str(dept.created_at) if dept.created_at else None,
+            "updated_at": str(dept.updated_at) if dept.updated_at else None,
+            # ✅ Veri bütünlüğü kontrolü
+            "data_integrity": {
+                "is_valid": True,
+                "issues": []
+            }
+        })
+        
+        # Veri bütünlüğü kontrolü
+        issues = []
+        
+        # 1. TYT kontrolü: TYT ise duration 2 olmalı
+        if dept.field_type == 'TYT' and dept.duration != 2:
+            issues.append(f"TYT bölümü ama duration={dept.duration} (2 olmalı)")
+            results[-1]["data_integrity"]["is_valid"] = False
+        
+        # 2. Önlisans kontrolü: Associate ise duration 2 olmalı
+        if dept.degree_type == 'Associate' and dept.duration != 2:
+            issues.append(f"Associate bölümü ama duration={dept.duration} (2 olmalı)")
+            results[-1]["data_integrity"]["is_valid"] = False
+        
+        # 3. Lisans kontrolü: Bachelor ise duration 4+ olmalı
+        if dept.degree_type == 'Bachelor' and dept.duration and dept.duration < 4:
+            issues.append(f"Bachelor bölümü ama duration={dept.duration} (4+ olmalı)")
+            results[-1]["data_integrity"]["is_valid"] = False
+        
+        # 4. TYT + Bachelor çelişkisi
+        if dept.field_type == 'TYT' and dept.degree_type == 'Bachelor':
+            issues.append("TYT puan türü ama Bachelor derecesi (çelişki!)")
+            results[-1]["data_integrity"]["is_valid"] = False
+        
+        # 5. SAY/EA/SÖZ/DİL + Associate çelişkisi (nadir ama olabilir)
+        if dept.field_type in ['SAY', 'EA', 'SÖZ', 'DİL'] and dept.degree_type == 'Associate':
+            issues.append(f"{dept.field_type} puan türü ama Associate derecesi (genelde lisans olur)")
+        
+        results[-1]["data_integrity"]["issues"] = issues
+    
+    return {
+        "status": "found",
+        "count": len(results),
+        "results": results
+    }
+

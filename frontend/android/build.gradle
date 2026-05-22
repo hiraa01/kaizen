@@ -1,0 +1,40 @@
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.buildDir = '../build'
+subprojects {
+    project.buildDir = "${rootProject.buildDir}/${project.name}"
+    
+    // Fix for plugins that don't support new Flutter Gradle plugin structure
+    // This fixes speech_to_text and other plugins that reference flutter.compileSdkVersion
+    beforeEvaluate { project ->
+        // Set flutter extension properties for plugins that need them
+        if (!project.hasProperty('flutter')) {
+            project.ext.flutter = [
+                compileSdkVersion: 36,
+                minSdkVersion: 24, // Updated to 24 as per Flutter's new minimum requirement
+                targetSdkVersion: 36
+            ]
+        }
+    }
+    
+    afterEvaluate { project ->
+        if (project.hasProperty('android')) {
+            // Set compileSdk if not already set
+            if (project.android.hasProperty('compileSdkVersion') && project.android.compileSdkVersion == null) {
+                project.android.compileSdkVersion = 36
+            }
+            if (project.android.hasProperty('compileSdk') && project.android.compileSdk == null) {
+                project.android.compileSdk = 36
+            }
+        }
+    }
+}
+
+tasks.register("clean", Delete) {
+    delete rootProject.buildDir
+}

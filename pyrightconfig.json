@@ -1,0 +1,43 @@
+{
+    "include": [
+        "backend"
+    ],
+    "exclude": [
+        ".git/**",
+        "frontend/**",
+        "docker/**",
+        "**/node_modules/**",
+        "**/.dart_tool/**",
+        "**/build/**",
+        "**/.gradle/**",
+        "**/ios/Pods/**",
+        "**/.pub-cache/**",
+        "**/coverage/**",
+        "backend/logs/**",
+        "backend/ml_models/**",
+        "**/*.xlsx",
+        "**/*.csv",
+        "**/*.sqlite",
+        "**/*.db"
+    ],
+    "ignore": [
+        "**/__pycache__/**",
+        "**/.venv/**",
+        "**/.mypy_cache/**"
+    ],
+    "typeCheckingMode": "basic",
+    "reportMissingImports": "none",
+    "reportMissingTypeStubs": "none",
+    "useLibraryCodeForTypes": true,
+    "executionEnvironments": [
+        {
+            "root": "backend",
+            "extraPaths": [
+                "backend",
+                "backend/routers",
+                "backend/services",
+                "backend/schemas"
+            ]
+        }
+    ]
+}

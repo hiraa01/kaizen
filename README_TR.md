@@ -44,47 +44,22 @@ kAIzen, YKS'ye hazırlanan öğrenciler için yapay zeka destekli bir üniversit
 
 ### 1. Backend Kurulumu
 
+> Önerilen yöntem Docker Compose'dur; servis adı ve container adı (`osym_rehberi_backend`) bu dosyadaki `docker-compose.yml` ile tanımlıdır, manuel `docker build`/`docker run` ile başka bir isim kullanırsanız aşağıdaki "Sorun Giderme" komutları eşleşmez.
+
 ```bash
-# Backend dizinine gidin
-cd backend
-
-# Docker image oluşturun
-docker build -t osym-backend .
-
-# Container'ı başlatın
-docker run -d -p 8003:8000 --name osym-backend osym-backend
-
-# Veya docker-compose ile
-cd ../docker
-docker-compose up -d backend
+cd docker
+docker-compose up -d backend db redis
 ```
 
-Backend şu adreste çalışacak:
+Backend **yerel ortamda** şu adreste çalışacak (yalnızca geliştirme için — production'da gerçek alan adı/reverse proxy kullanılır):
 - API: http://localhost:8003
 - Swagger Docs: http://localhost:8003/docs
 
 ### 2. Frontend Kurulumu
 
-#### Docker ile (Önerilen)
+#### Flutter SDK ile (Önerilen)
 
-```bash
-cd frontend
-
-# Önce Docker image'ını build edin (Flutter 3.24.3 ile)
-docker build -t osym-frontend:latest .
-
-# Paketleri yükle (build edilmiş image ile)
-docker run --rm -v ${PWD}:/app -w /app osym-frontend:latest flutter pub get
-
-# Uygulamayı çalıştır
-docker run --rm -v ${PWD}:/app -w /app -p 8080:8080 osym-frontend:latest flutter run -d web-server --web-port=8080 --web-hostname=0.0.0.0
-
-# Veya docker-compose kullanarak
-cd ../docker
-docker-compose up frontend
-```
-
-#### Flutter SDK ile
+> `docker-compose.yml` içindeki `frontend` servisi şu an devre dışı (yorum satırı), bu yüzden mobil/web istemciyi Flutter SDK ile çalıştırmak önerilir. Docker image'ı yine de gerekirse `frontend/Dockerfile` üzerinden manuel build edilebilir.
 
 ```bash
 cd frontend
@@ -215,12 +190,12 @@ flutter run -d ios
 
 ```bash
 # Backend loglarını kontrol edin
-docker logs osym-backend
+docker logs osym_rehberi_backend
 
 # Backend'i yeniden başlatın
-docker restart osym-backend
+docker restart osym_rehberi_backend
 
-# Backend'in çalıştığını kontrol edin
+# Backend'in çalıştığını kontrol edin (yerel geliştirme adresi)
 curl http://localhost:8003/health
 ```
 

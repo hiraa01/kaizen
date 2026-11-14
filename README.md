@@ -47,16 +47,18 @@ cd docker
 docker compose up -d backend db redis
 ```
 
-### Servis adresleri
+### Servis adresleri (yerel geliştirme)
 
-| Servis | Adres |
+Aşağıdaki adresler **yalnızca yerel geliştirme ortamı** içindir (Docker Compose ile ayağa kalkan servisler); production/staging dağıtımında bunların yerini gerçek alan adı ve reverse proxy alır.
+
+| Servis | Yerel adres |
 |--------|--------|
 | Backend API | http://localhost:8003 |
 | Swagger UI | http://localhost:8003/docs |
 | Health | http://localhost:8003/health |
 | PostgreSQL (host) | localhost:5435 |
 
-> Container içinde uvicorn **8000** portunda dinler; host tarafında **8003** ile eşlenir (`8003:8000`).
+> Container içinde uvicorn **8000** portunda dinler; host tarafında **8003** ile eşlenir (`8003:8000`). `frontend` servisi `docker-compose.yml` içinde şu an devre dışı (yorum satırı) — mobil uygulamayı Flutter SDK ile çalıştırın (aşağıya bakın).
 
 ### Mobil cihaz (USB)
 
@@ -110,7 +112,7 @@ osym_rehberi/
 | ML | `POST /api/ml/train-models`, `GET /api/ml/model-status` |
 | Raporlar | `GET /api/reports/student/{id}/exam-attempts.csv` |
 
-Tam liste: http://localhost:8003/docs
+Tam liste (backend çalışırken): http://localhost:8003/docs
 
 ## Öneri sistemi
 

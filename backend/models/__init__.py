@@ -1,5 +1,4 @@
-# ✅ Models package - Relative import kullanarak circular import'u önle
-# ✅ CRITICAL: Absolute import (from models import ...) kullanma, relative import kullan (.user, .student)
+# Models package - relative import kullanarak circular import'u önle
 
 from .user import User
 from .student import Student
@@ -9,38 +8,9 @@ from .preference import Preference
 from .swipe import Swipe
 from .forum import ForumPost, ForumComment
 from .yok_data import YokUniversity, YokProgram, YokCity, ScoreCalculation
-
-# ✅ AgendaItem, StudySession, ChatMessage modelleri models.py'de olabilir
-# Eğer ayrı dosyalarda değillerse, models.py'den import et
-try:
-    from .agenda import AgendaItem
-except ImportError:
-    try:
-        # models.py'den import et (eğer orada tanımlıysa)
-        import sys
-        import os
-        parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        if parent_dir not in sys.path:
-            sys.path.insert(0, parent_dir)
-        from models import AgendaItem  # noqa: F401
-    except ImportError:
-        AgendaItem = None
-
-try:
-    from .study import StudySession
-except ImportError:
-    try:
-        from models import StudySession  # noqa: F401
-    except ImportError:
-        StudySession = None
-
-try:
-    from .chat import ChatMessage
-except ImportError:
-    try:
-        from models import ChatMessage  # noqa: F401
-    except ImportError:
-        ChatMessage = None
+from .agenda import AgendaItem
+from .study import StudySession
+from .chat import ChatMessage
 
 __all__ = [
     "User",

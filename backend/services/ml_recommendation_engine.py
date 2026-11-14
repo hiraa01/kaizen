@@ -7,11 +7,13 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from xgboost import XGBRegressor
 from typing import List, Dict, Any, Tuple, Optional
 import joblib
 import os
 import json
+from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 from sqlalchemy.orm import selectinload
 from models import Student, Department, Recommendation, University
@@ -33,6 +35,9 @@ class MLRecommendationEngine:
         elif os.path.exists("ml_models"):
             self.model_path = "ml_models/"
         
+        # Son eğitimin gerçek regresyon metrikleri (RMSE/MAE/R2) - sadece R2 değil
+        self.last_training_metrics: Dict[str, Any] = {}
+
         # Model dosyalarını yükle
         self._load_models()
     
@@ -54,7 +59,27 @@ class MLRecommendationEngine:
             
             # Modelleri kaydet
             self._save_models()
-            
+
+            # Gerçek regresyon metriklerini (RMSE/MAE/R2) diske yaz - R2 tek başına yanıltıcı
+            try:
+                metrics_report = {
+                    "trained_at": datetime.now(timezone.utc).isoformat(),
+                    "n_samples": len(training_data),
+                    "models": self.last_training_metrics,
+                    "note": (
+                        "Bu eğitim verisi sentetik/kural tabanlı etiketlerle üretildiyse, "
+                        "bu metrikler gerçek yerleşme/isabet oranini GOSTERMEZ; sadece modelin "
+                        "etiketleme kuralini ne kadar iyi ogrendigini gosterir."
+                    ),
+                }
+                os.makedirs(self.model_path, exist_ok=True)
+                metrics_path = os.path.join(self.model_path, "training_metrics.json")
+                with open(metrics_path, "w", encoding="utf-8") as f:
+                    json.dump(metrics_report, f, ensure_ascii=False, indent=2)
+                recommendation_logger.info("Training metrics saved", path=metrics_path)
+            except Exception as metrics_err:
+                recommendation_logger.warning("Could not persist training metrics", error=str(metrics_err))
+
             self.is_trained = True
             recommendation_logger.info("ML models trained successfully")
             
@@ -424,6 +449,37 @@ class MLRecommendationEngine:
         combined = np.concatenate([student_features, dept_features, interaction_features])
         return combined
     
+    def _evaluate_model(self, name: str, model, X_train, y_train, X_test, y_test) -> Dict[str, float]:
+        """Gerçek regresyon metriklerini hesapla (sadece R2 değil RMSE/MAE de).
+
+        NOT: Bu değerler, model.score() çağrısından farklı olarak, modelin
+        ÖLÇÜM BİRİMİNDE (0-1 aralığındaki skorlarda) ortalama hatasını verir ve
+        model eğitiminde kullanılan etiketlerin gerçek/sentetik olmasına göre
+        yorumlanmalıdır. Sentetik etiketlerle eğitilmiş bir modelde yüksek R2,
+        sadece kodun kendi kuralını ne kadar iyi öğrendiğini gösterir; gerçek
+        dünya isabetini göstermez.
+        """
+        pred_train = model.predict(X_train)
+        pred_test = model.predict(X_test)
+
+        metrics = {
+            "n_train": int(len(y_train)),
+            "n_test": int(len(y_test)),
+            "train_rmse": float(np.sqrt(mean_squared_error(y_train, pred_train))),
+            "train_mae": float(mean_absolute_error(y_train, pred_train)),
+            "train_r2": float(r2_score(y_train, pred_train)),
+            "test_rmse": float(np.sqrt(mean_squared_error(y_test, pred_test))),
+            "test_mae": float(mean_absolute_error(y_test, pred_test)),
+            "test_r2": float(r2_score(y_test, pred_test)),
+        }
+
+        recommendation_logger.info(
+            f"{name} model evaluated",
+            **metrics,
+        )
+        self.last_training_metrics[name] = metrics
+        return metrics
+
     def _train_compatibility_model(self, X: np.ndarray, y: np.ndarray):
         """Uyumluluk modelini eğit - XGBoost ile iyileştirilmiş"""
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
@@ -452,9 +508,7 @@ class MLRecommendationEngine:
         self.scalers['compatibility'] = scaler
         
         # Performansı logla
-        train_score = model.score(X_train_scaled, y_train)
-        test_score = model.score(X_test_scaled, y_test)
-        recommendation_logger.info("Compatibility model trained", train_score=train_score, test_score=test_score)
+        self._evaluate_model("compatibility", model, X_train_scaled, y_train, X_test_scaled, y_test)
     
     def _train_success_model(self, X: np.ndarray, y: np.ndarray):
         """Başarı olasılığı modelini eğit - XGBoost ile iyileştirilmiş"""
@@ -483,9 +537,7 @@ class MLRecommendationEngine:
         self.models['success'] = model
         self.scalers['success'] = scaler
         
-        train_score = model.score(X_train_scaled, y_train)
-        test_score = model.score(X_test_scaled, y_test)
-        recommendation_logger.info("Success model trained", train_score=train_score, test_score=test_score)
+        self._evaluate_model("success", model, X_train_scaled, y_train, X_test_scaled, y_test)
     
     def _train_preference_model(self, X: np.ndarray, y: np.ndarray):
         """Tercih modelini eğit - XGBoost ile iyileştirilmiş"""
@@ -512,9 +564,7 @@ class MLRecommendationEngine:
         self.models['preference'] = model
         self.scalers['preference'] = scaler
         
-        train_score = model.score(X_train_scaled, y_train)
-        test_score = model.score(X_test_scaled, y_test)
-        recommendation_logger.info("Preference model trained", train_score=train_score, test_score=test_score)
+        self._evaluate_model("preference", model, X_train_scaled, y_train, X_test_scaled, y_test)
     
     def _predict_compatibility(self, features: np.ndarray) -> float:
         """Uyumluluk skorunu tahmin et"""

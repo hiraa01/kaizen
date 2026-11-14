@@ -118,22 +118,18 @@ metadata = MetaData()
 # ✅ IMPORT ALL MODELS (After Base is created, before create_tables is called)
 # ✅ CRITICAL: models/__init__.py'den relative import kullanarak circular import'u önle
 try:
-    # ✅ models paketinden import et (relative import kullanıyor)
+    # models paketinden import et (relative import kullanıyor)
     from models import (  # noqa: F401
         User, Student, ExamAttempt,
         University, Department, DepartmentYearlyStats, Recommendation,
         Preference, Swipe,
         ForumPost, ForumComment,
-        YokUniversity, YokProgram, YokCity, ScoreCalculation
+        YokUniversity, YokProgram, YokCity, ScoreCalculation,
+        AgendaItem, StudySession, ChatMessage,
     )
-    # ✅ AgendaItem, StudySession, ChatMessage opsiyonel (eğer varsa)
-    try:
-        from models import AgendaItem, StudySession, ChatMessage  # noqa: F401
-    except ImportError:
-        api_logger.warning("⚠️ AgendaItem, StudySession, ChatMessage modelleri bulunamadı (opsiyonel)")
-    
+
     api_logger.info("✅ All models imported successfully from models package")
-        
+
 except ImportError as e:
     api_logger.error(f"❌ CRITICAL: Failed to import models: {e}")
     api_logger.error("❌ Some models may not be registered with Base.metadata!")

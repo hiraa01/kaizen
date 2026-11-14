@@ -86,6 +86,9 @@ class Student(Base):
     forum_comments = relationship("ForumComment", back_populates="student", cascade="all, delete-orphan")
     exam_attempts = relationship("ExamAttempt", back_populates="student", cascade="all, delete-orphan")
     swipes = relationship("Swipe", back_populates="student", cascade="all, delete-orphan")
+    agenda_items = relationship("AgendaItem", back_populates="student", cascade="all, delete-orphan")
+    study_sessions = relationship("StudySession", back_populates="student", cascade="all, delete-orphan")
+    chat_messages = relationship("ChatMessage", back_populates="student", cascade="all, delete-orphan")
     
     def __repr__(self):
         return f"<Student(id={self.id}, name='{self.name}', exam_type='{self.exam_type}')>"

@@ -54,3 +54,7 @@ docker/.env
 build/
 .flutter-plugins
 .flutter-plugins-dependencies
+
+# Local DB files / dumps - repoya dahil edilmemeli
+backend/*.db
+docker/*.tar.gz

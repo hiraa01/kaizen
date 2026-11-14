@@ -114,6 +114,19 @@ def train_models():
         print("✅ ML modelleri başarıyla eğitildi!")
         print(f"📊 Eğitim verisi: {len(training_data)} örnek")
         print("🎯 Modeller kaydedildi: models/ klasörü")
+
+        # ✅ Gerçek regresyon metrikleri (RMSE/MAE/R2) - model.score() (sadece R2) yeterli değil
+        if ml_engine.last_training_metrics:
+            print("\n📐 Değerlendirme metrikleri (test seti):")
+            for model_name, m in ml_engine.last_training_metrics.items():
+                print(
+                    f"   {model_name}: RMSE={m['test_rmse']:.4f}  MAE={m['test_mae']:.4f}  "
+                    f"R2={m['test_r2']:.4f}  (n_test={m['n_test']})"
+                )
+            print(
+                "   ⚠️  Bu metrikler, eğitim verisi sentetik/kural tabanlı etiketlerle "
+                "üretildiyse gerçek isabet oranını göstermez."
+            )
         
         # Test önerisi oluştur (veritabanından ilk öğrenciyi bul)
         print("\n🧪 Test önerisi oluşturuluyor...")
